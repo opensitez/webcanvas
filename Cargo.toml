@@ -1,0 +1,18 @@
+[package]
+name = "webcanvas"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone, embeddable Canvas 2D renderer for Rust applications"
+license = "GPL-3.0-or-later OR LicenseRef-Commercial"
+repository = "https://github.com/opensitez/webcanvas"
+readme = "README.md"
+keywords = ["canvas", "graphics", "raster", "browser", "whatwg"]
+categories = ["graphics", "rendering", "web-programming"]
+
+[dependencies]
+tiny-skia = "0.12"
+cosmic-text = "0.18.2"
+swash = "0.2"
+base64 = "0.21"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rayon = "1.10"
