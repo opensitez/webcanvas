@@ -118,12 +118,7 @@ impl CanvasSurfaces {
             }
             let mut scratch = Pixmap::new(1, 1)?;
             let saved = self.states.remove(&node_id).unwrap_or_default();
-            let fonts = self
-                .fonts
-                .get_or_insert_with(|| Box::new((FontSystem::new(), SwashCache::new())));
-            let (font_system, swash_cache) = &mut **fonts;
-            let mut canvas =
-                TinySkiaCanvas::resume_empty(&mut scratch, saved, Some((font_system, swash_cache)));
+            let mut canvas = TinySkiaCanvas::resume_empty_lazy(&mut scratch, saved, &mut self.fonts);
             canvas.set_syntax(syntax);
             let out = f(&mut canvas);
             self.states.insert(node_id, canvas.suspend());
@@ -139,13 +134,7 @@ impl CanvasSurfaces {
         let mut pixmap = Pixmap::from_vec(std::mem::take(pixels), size)?;
 
         let saved = self.states.remove(&node_id).unwrap_or_default();
-        let fonts = self
-            .fonts
-            .get_or_insert_with(|| Box::new((FontSystem::new(), SwashCache::new())));
-        let (font_system, swash_cache) = &mut **fonts;
-
-        let mut canvas =
-            TinySkiaCanvas::resume(&mut pixmap, saved, Some((font_system, swash_cache)));
+        let mut canvas = TinySkiaCanvas::resume_lazy(&mut pixmap, saved, &mut self.fonts);
         canvas.set_syntax(syntax);
         let out = f(&mut canvas);
         self.states.insert(node_id, canvas.suspend());
@@ -172,5 +161,37 @@ impl std::fmt::Debug for CanvasSurfaces {
             .field("canvases", &self.states.len())
             .field("fonts_loaded", &self.fonts.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::{Color, Image};
+    use std::sync::Arc;
+
+    #[test]
+    fn image_and_shape_drawing_do_not_initialize_fonts() {
+        let mut surfaces = CanvasSurfaces::default();
+        let mut pixels = vec![0; 16 * 16 * 4];
+        let image = Image {
+            width: 1,
+            height: 1,
+            pixels: Arc::new(vec![0, 255, 0, 255]),
+            origin_clean: true,
+        };
+        surfaces
+            .with_context(1, &mut pixels, 16, 16, |ctx| {
+                ctx.set_fill_color(Color::rgb(255, 0, 0));
+                ctx.fill_rect(0.0, 0.0, 16.0, 16.0);
+                ctx.draw_image(&image, 0.0, 0.0, 1.0, 1.0);
+            })
+            .unwrap();
+        assert!(surfaces.fonts.is_none());
+
+        surfaces
+            .with_context(1, &mut pixels, 16, 16, |ctx| ctx.fill_text("x", 0.0, 12.0))
+            .unwrap();
+        assert!(surfaces.fonts.is_some());
     }
 }

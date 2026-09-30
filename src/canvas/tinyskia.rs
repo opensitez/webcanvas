@@ -152,9 +152,21 @@ impl CanvasState {
 /// the rest of the toolkit via `RenderContext::font_system /
 /// swash_cache`. Optional so callers that don't need text don't have
 /// to set up cosmic-text.
-struct TextCtx<'a> {
-    font_system: &'a mut FontSystem,
-    swash_cache: &'a mut SwashCache,
+enum TextCtx<'a> {
+    Borrowed(&'a mut FontSystem, &'a mut SwashCache),
+    Lazy(&'a mut Option<Box<(FontSystem, SwashCache)>>),
+}
+
+impl TextCtx<'_> {
+    fn resources(&mut self) -> (&mut FontSystem, &mut SwashCache) {
+        match self {
+            Self::Borrowed(font_system, swash_cache) => (font_system, swash_cache),
+            Self::Lazy(slot) => {
+                let resources = slot.get_or_insert_with(|| Box::new((FontSystem::new(), SwashCache::new())));
+                (&mut resources.0, &mut resources.1)
+            }
+        }
+    }
 }
 
 fn text_transform_scale(transform: Transform) -> f32 {
@@ -282,10 +294,7 @@ impl<'a> TinySkiaCanvas<'a> {
             state: PaintState::default(),
             state_stack: Vec::new(),
             path: PathBuilder::new(),
-            text_ctx: Some(TextCtx {
-                font_system,
-                swash_cache,
-            }),
+            text_ctx: Some(TextCtx::Borrowed(font_system, swash_cache)),
             clip_mask: None,
             origin_tainted: false,
         }
@@ -320,23 +329,28 @@ impl<'a> TinySkiaCanvas<'a> {
             state: saved.state,
             state_stack: saved.state_stack,
             path: saved.path,
-            text_ctx: text.map(|(font_system, swash_cache)| TextCtx {
-                font_system,
-                swash_cache,
-            }),
+            text_ctx: text.map(|(font_system, swash_cache)| TextCtx::Borrowed(font_system, swash_cache)),
             clip_mask: saved.clip_mask,
             origin_tainted: saved.origin_tainted,
         }
     }
 
-    /// Keep the drawing state of a zero-sized canvas without exposing the
-    /// one-pixel scratch pixmap used by the raster backend.
-    pub(crate) fn resume_empty(
+    pub(crate) fn resume_lazy(
+        pixmap: &'a mut Pixmap,
+        saved: CanvasState,
+        fonts: &'a mut Option<Box<(FontSystem, SwashCache)>>,
+    ) -> Self {
+        let mut canvas = Self::resume(pixmap, saved, None);
+        canvas.text_ctx = Some(TextCtx::Lazy(fonts));
+        canvas
+    }
+
+    pub(crate) fn resume_empty_lazy(
         scratch: &'a mut Pixmap,
         saved: CanvasState,
-        text: Option<(&'a mut FontSystem, &'a mut SwashCache)>,
+        fonts: &'a mut Option<Box<(FontSystem, SwashCache)>>,
     ) -> Self {
-        let mut canvas = Self::resume(scratch, saved, text);
+        let mut canvas = Self::resume_lazy(scratch, saved, fonts);
         canvas.empty_bitmap = true;
         canvas
     }
@@ -780,10 +794,11 @@ impl<'a> Canvas for TinySkiaCanvas<'a> {
         // above was for.
         self.with_effects(|target, state, clip| {
             if matches!(state.fill, CanvasPaint::Color(_)) {
+                let (font_system, swash_cache) = owned_tc.resources();
                 super::text::blit_shaped_buffer(
                     target,
-                    owned_tc.font_system,
-                    owned_tc.swash_cache,
+                    font_system,
+                    swash_cache,
                     &mut buf,
                     px,
                     py,
@@ -796,10 +811,11 @@ impl<'a> Canvas for TinySkiaCanvas<'a> {
             let Some(mut glyphs) = Pixmap::new(target.width(), target.height()) else {
                 return;
             };
+            let (font_system, swash_cache) = owned_tc.resources();
             super::text::blit_shaped_buffer(
                 &mut glyphs,
-                owned_tc.font_system,
-                owned_tc.swash_cache,
+                font_system,
+                swash_cache,
                 &mut buf,
                 px,
                 py,
@@ -1223,7 +1239,8 @@ impl<'a> Canvas for TinySkiaCanvas<'a> {
         let mut ink_bottom = f32::NEG_INFINITY;
         for glyph in run.glyphs {
             let physical = glyph.physical((0.0, 0.0), 1.0);
-            let Some(image) = tc.swash_cache.get_image(tc.font_system, physical.cache_key) else {
+            let (font_system, swash_cache) = tc.resources();
+            let Some(image) = swash_cache.get_image(font_system, physical.cache_key) else {
                 continue;
             };
             if image.placement.width == 0 || image.placement.height == 0 {
@@ -2167,7 +2184,8 @@ fn glyph_outlines(tc: &mut TextCtx<'_>, buf: &Buffer, px: f32, py: f32) -> Optio
         // already the origin `text_origin` resolved.
         let base_y = py + run.line_y;
         for glyph in run.glyphs {
-            let Some(font) = tc.font_system.get_font(glyph.font_id, glyph.font_weight) else {
+            let (font_system, _) = tc.resources();
+            let Some(font) = font_system.get_font(glyph.font_id, glyph.font_weight) else {
                 continue;
             };
             let mut scaler = context
@@ -2235,19 +2253,20 @@ fn glyph_outlines(tc: &mut TextCtx<'_>, buf: &Buffer, px: f32, py: f32) -> Optio
 fn shape_text(tc: &mut TextCtx<'_>, state: &PaintState, text: &str, scale: f32) -> Buffer {
     let size = state.font.size;
     let metrics = Metrics::new(size, size * 1.3).scale(scale);
-    let mut buf = Buffer::new(tc.font_system, metrics);
+    let (font_system, _) = tc.resources();
+    let mut buf = Buffer::new(font_system, metrics);
     let attrs = build_attrs(state);
     match word_spacing_spans(text, state, &attrs) {
         Some(spans) => buf.set_rich_text(
-            tc.font_system,
+            font_system,
             spans.iter().map(|(s, a)| (*s, a.clone())),
             &attrs,
             Shaping::Advanced,
             None,
         ),
-        None => buf.set_text(tc.font_system, text, &attrs, Shaping::Advanced, None),
+        None => buf.set_text(font_system, text, &attrs, Shaping::Advanced, None),
     }
-    buf.shape_until_scroll(tc.font_system, false);
+    buf.shape_until_scroll(font_system, false);
     buf
 }
 
